@@ -1,0 +1,61 @@
+##############################################################################
+# A52 线云编译入口（Windows）→ FreePick / Hero 两种模式共用这一份二进制
+#
+# 放在 fork 仓库 .github/workflows/build-a52-windows.yml
+# Actions → Build A52 (Windows) → Run workflow → 什么都不用填
+#
+# 默认：
+#   核心 = CWO4PapaBear/azerothcore-wotlk-coa @ main
+#   模块 = Brytenwally/mod-playerbots @ area52-freepick
+#
+# 产物 a52-server-windows-rXX.zip → 解压到 E:\Coa Compile\out\a52\
+# 本文件必须提交在仓库默认分支（main）上，Actions 列表里才会出现。
+##############################################################################
+name: Build A52 (Windows)
+
+on:
+  workflow_dispatch:
+    inputs:
+      core_ref:
+        description: '核心分支/标签/commit（留空 = main）'
+        required: false
+        default: ''
+      module_ref:
+        description: 'mod-playerbots 分支（留空 = area52-freepick）'
+        required: false
+        default: ''
+      build_type:
+        description: '构建类型'
+        type: choice
+        options:
+          - 'RelWithDebInfo'
+          - 'Release'
+        default: 'RelWithDebInfo'
+      build_tools:
+        description: '是否同时编译地图提取工具'
+        type: choice
+        options:
+          - 'no'
+          - 'yes'
+        default: 'no'
+      db_source:
+        description: '是否打包 SQL 源目录（本地有源码时不需要）'
+        type: choice
+        options:
+          - 'no'
+          - 'yes'
+        default: 'no'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-profile-windows.yml
+    with:
+      profile: a52
+      core_ref: ${{ inputs.core_ref }}
+      module_ref: ${{ inputs.module_ref }}
+      build_type: ${{ inputs.build_type }}
+      build_tools: ${{ inputs.build_tools }}
+      db_source: ${{ inputs.db_source }}

@@ -1,0 +1,977 @@
+##############################################################################
+# Conquest of Azeroth（核心）+ mod-playerbots（模块）云编译 —— Windows 版
+#
+# 放到仓库的 .github/workflows/build-windows.yml
+# Actions → Build CoA + Playerbots (Windows) → Run workflow
+# 已 Fork 的话【什么都不用填】，直接 Run：core_repo 留空即代表编译你自己的 fork
+# 产物：运行页面底部 Artifacts → coa-server-windows-rXX.zip
+#       最终包：authserver.exe + worldserver.exe + 运行时 DLL
+#       （libmysql / libcrypto-3-x64 / libssl-3-x64 / legacy / VC 运行库）
+#       配置模板、SQL、BUILD_INFO 等一律不打包 —— 本地源码里本来就有，
+#       没必要重复下载。
+#       另有一个可选的 coa-db-source-rXX.zip（约 240MB，数据库源目录），
+#       由输入项 db_source 控制，默认 no（本地已有源码就不需要）。
+#
+# 想确认"包到底传上去没有"：看运行摘要里的「最终产物（authserver.exe + worldserver.exe + 运行时 DLL）」，
+# 有直链 + SHA-256 就是真上去了（最后一步在拿不到 artifact-url 时会直接报错）。
+#
+# ★ 工作流分成两个作业 —— 为的是「打包失败不用重新编译」：
+#     build   —— 编译（两小时上下），完事后把整个 env/dist 存成
+#                「编译原始产物」artifact（保留 7 天）
+#     package —— 取回那份原始产物，挑出两个 exe + 运行时 DLL 做最终包（几十秒）
+#   打包环节一旦出问题：运行页面右上角 Re-run jobs → **Re-run failed jobs**，
+#   只重跑 package 就行 —— 编译作业是成功的，不会重跑，它上传的 artifact
+#   在重跑中依然可用（GitHub 官方文档明文说明）。
+#   ⚠ 别点 "Re-run all jobs" —— 那个会把编译一起重来（又是两小时）。
+#
+# ★ 体积只打印、不做任何判断 —— 绝不因为 exe 小而拦下上传。
+#   一次误判的代价是"作业失败 + 再等两小时全量编译"，比"万一传了个小包"严重得多。
+#   唯一的硬条件是 env/dist 里得有 exe。
+# ★ ccache 缓存是"失败也保存"的（restore/save 拆开 + !cancelled()），
+#   所以中间某步报错也不会把两小时的编译成果一起丢掉。
+#
+# 最终产物保留 30 天，编译原始产物保留 7 天。
+# 首次全量编译约 2~4 小时（4 核 runner），第二次起有 ccache 会快很多。
+# 想要快就用 build-linux.yml（约 40~70 分钟）。
+##############################################################################
+name: Build CoA + Playerbots (Windows)
+
+on:
+  workflow_dispatch:
+    inputs:
+      core_repo:
+        description: '核心仓库 (owner/repo)。留空 = 编译当前仓库，也就是你的 fork'
+        required: false
+        default: ''
+      core_ref:
+        description: '核心分支 / 标签 / commit'
+        required: true
+        default: 'main'
+      module_repo:
+        description: '模块仓库 (owner/repo)'
+        required: true
+        default: 'Zyth45/mod-playerbots'
+      module_ref:
+        description: '模块分支 / 标签 / commit'
+        required: true
+        default: 'coa'
+      build_tools:
+        description: '是否同时编译地图提取工具 (map/vmap/mmap)'
+        type: choice
+        options:
+          - 'no'
+          - 'yes'
+        default: 'no'
+      db_source:
+        description: '是否打包数据库源目录 coa-db-source（约 240MB，全是 SQL；本地已有源码时不需要）'
+        type: choice
+        options:
+          - 'no'
+          - 'yes'
+        default: 'no'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (编译)
+    runs-on: windows-2022
+    timeout-minutes: 355
+    # 同一分支不并发跑两次编译（免得两个两小时的任务同时占额度）。
+    # 特意放在 build 作业上、而不是 workflow 级 —— 免得把同一个 run 里的
+    # package 作业也卷进排队：package 只是几十秒的收尾活，不该受这个约束。
+    concurrency:
+      group: coa-build-windows-${{ github.ref }}
+      cancel-in-progress: false
+
+    env:
+      BOOST_ROOT: C:\local\boost_1_87_0
+      CMAKE_GENERATOR: Ninja
+
+    steps:
+      # ------------------------------------------------------------------
+      # 1. 取两份源码：核心放工作区，模块放进核心的 modules/ 目录
+      # ------------------------------------------------------------------
+      - name: 拉取核心源码
+        uses: actions/checkout@v4
+        with:
+          # core_repo 留空时 = github.repository，即当前仓库（你 fork 的那份）
+          repository: ${{ inputs.core_repo != '' && inputs.core_repo || github.repository }}
+          ref: ${{ inputs.core_ref }}
+          path: a
+          fetch-depth: 1
+
+      - name: 拉取 mod-playerbots 到 core 的 modules 目录
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.module_repo }}
+          ref: ${{ inputs.module_ref }}
+          path: a/modules/mod-playerbots
+          fetch-depth: 1
+
+      # MSVC 有 260 字符路径限制，先搬到 C:\ac 这样的短路径再编译
+      - name: 移动到短路径 C:\ac
+        shell: pwsh
+        run: |
+          if (Test-Path C:\ac) { Remove-Item C:\ac -Recurse -Force }
+          New-Item -ItemType Directory -Path C:\ac | Out-Null
+          robocopy "${{ github.workspace }}\a" "C:\ac" /MIR /NFL /NDL /NJH /NJS /NP
+          if ($LASTEXITCODE -le 7) { exit 0 }
+          exit $LASTEXITCODE
+
+      - name: 记录本次实际编译的版本
+        shell: bash
+        run: |
+          CORE_REPO="${{ inputs.core_repo != '' && inputs.core_repo || github.repository }}"
+          {
+            echo "### 本次编译的版本"
+            echo ""
+            echo "| 来源 | 版本 | commit |"
+            echo "|---|---|---|"
+            echo "| core | ${CORE_REPO}@${{ inputs.core_ref }} | \`$(git -C /c/ac rev-parse --short HEAD)\` |"
+            echo "| mod  | ${{ inputs.module_repo }}@${{ inputs.module_ref }} | \`$(git -C /c/ac/modules/mod-playerbots rev-parse --short HEAD)\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # 2. 准备依赖：Boost / MySQL 客户端 / OpenSSL / Ninja
+      #    （windows-2022 镜像自带 CMake、VS2022、OpenSSL，但不带 Boost 和 MySQL 开发库）
+      # ------------------------------------------------------------------
+      - name: 缓存 Boost（与 MySQL 版本无关，单独缓存避免换 MySQL 版本时白下载）
+        uses: actions/cache@v4
+        with:
+          path: C:\local\boost_1_87_0
+          key: win-deps-boost-1.87.0
+
+      - name: 缓存 MySQL 客户端（版本钉死 8.4.9；以后换版本时改 key 后缀强制重下）
+        uses: actions/cache@v4
+        with:
+          path: C:\tools\mysql\current
+          key: win-deps-mysql-8.4.9-v2
+
+      - name: 缓存 Win64 OpenSSL（版本钉死 3.6.5；换版本时改 key 后缀强制重下）
+        uses: actions/cache@v4
+        with:
+          path: C:\openssl
+          key: win-deps-openssl-3.6.5
+
+      - name: 安装 Ninja 与 Boost 1.87
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          choco install ninja -y --no-progress
+
+          if (Test-Path 'C:\local\boost_1_87_0\boost\version.hpp') {
+            Write-Host 'Boost 命中缓存，跳过安装'
+            exit 0
+          }
+
+          # 首选 chocolatey（与 mod-playerbots 官方 CI 一致，装到 C:\local\boost_1_87_0）
+          choco install boost-msvc-14.3 --version=1.87.0 -y --no-progress
+          if (Test-Path 'C:\local\boost_1_87_0\boost\version.hpp') {
+            Write-Host 'choco 安装 Boost 成功'
+            exit 0
+          }
+
+          # 兜底：从 SourceForge 官方预编译包直接装
+          Write-Host 'choco 失败，改用 SourceForge 官方包'
+          $exe = Join-Path $env:RUNNER_TEMP 'boost.exe'
+          Invoke-WebRequest -Uri 'https://downloads.sourceforge.net/project/boost/boost-binaries/1.87.0/boost_1_87_0-msvc-14.3-64.exe' `
+            -OutFile $exe -UserAgent 'coa-ci' -MaximumRetryCount 3 -RetryIntervalSec 15
+          Start-Process -FilePath $exe -Wait -ArgumentList @(
+            '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/DIR=C:\local\boost_1_87_0'
+          )
+          if (-not (Test-Path 'C:\local\boost_1_87_0\boost\version.hpp')) { throw 'Boost 安装失败' }
+
+      # 关键：Windows 下 acore.sh 会把 MySQL 路径硬编码成 C:\tools\mysql\current，
+      # 镜像上没有这个目录，不准备的话 CMake 会直接报找不到 MySQL。
+      - name: 安装 MySQL 8.4 客户端库
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if (Test-Path 'C:\tools\mysql\current\lib\mysqlclient.lib') {
+            Write-Host 'MySQL 客户端命中缓存，跳过下载'
+            exit 0
+          }
+
+          $zip = Join-Path $env:RUNNER_TEMP 'mysql.zip'
+          # 必须带浏览器 UA，否则 Oracle 返回的是 HTML 错误页
+          Invoke-WebRequest -Uri 'https://cdn.mysql.com/archives/mysql-8.4/mysql-8.4.9-winx64.zip' `
+            -OutFile $zip -UserAgent 'Mozilla/5.0'
+          $mb = (Get-Item $zip).Length / 1MB
+          Write-Host ("下载 MySQL zip: {0:N1} MB" -f $mb)
+          if ($mb -lt 50) { throw "MySQL 包大小异常（$([int]$mb) MB）" }
+
+          New-Item -ItemType Directory -Force -Path 'C:\tools\mysql' | Out-Null
+          Expand-Archive -Path $zip -DestinationPath 'C:\tools\mysql' -Force
+          if (Test-Path 'C:\tools\mysql\current') { Remove-Item -Recurse -Force 'C:\tools\mysql\current' }
+          Rename-Item 'C:\tools\mysql\mysql-8.4.9-winx64' 'C:\tools\mysql\current'
+
+          if (-not (Test-Path 'C:\tools\mysql\current\lib\mysqlclient.lib')) {
+            throw '没找到 C:\tools\mysql\current\lib\mysqlclient.lib'
+          }
+
+          # 版本硬断言：防止“缓存命中了旧版本（如 8.4.13）”导致编译出的 exe 版本 id
+          # 与运行时 libmysql.dll 不一致，worldserver 启动报
+          # “does not match the version id used to compile AzerothCore”。
+          $actual = $null
+          $vh = 'C:\tools\mysql\current\include\mysql_version.h'
+          if (Test-Path $vh) {
+            # 官方二进制包的 mysql_version.h 只含 MYSQL_VERSION_ID（如 80409），没有 MAJOR/MINOR/PATCH 宏
+            $idLine = Select-String -Path $vh -Pattern '^#define\s+MYSQL_VERSION_ID\s+(\d+)' | Select-Object -First 1
+            if ($idLine) {
+              $id = [int]$idLine.Matches[0].Groups[1].Value
+              $actual = '{0}.{1}.{2}' -f ([math]::Floor($id / 10000)), ([math]::Floor(($id % 10000) / 100)), ($id % 100)
+            }
+          }
+          if (-not $actual -and (Test-Path 'C:\tools\mysql\current\bin\mysql.exe')) {
+            $actual = (& 'C:\tools\mysql\current\bin\mysql.exe' --version) -replace '.*Ver\s+([\d.]+).*', '$1'
+          }
+          if (-not $actual) {
+            Write-Warning '无法判定 MySQL 实际版本，跳过断言（请手动确认是 8.4.9）'
+          } else {
+            Write-Host "实际 MySQL 版本: $actual"
+            if ($actual -ne '8.4.9') {
+              throw "MySQL 实际版本是 $actual，不是固定的 8.4.9。多半是 GitHub Actions 缓存里残留了旧版本——请把上面 MySQL 缓存 key 的后缀改掉（如 -v3）强制重新下载，否则编出的 exe 会与运行时 DLL 版本对不上。"
+            }
+          }
+
+      - name: 安装 Win64 OpenSSL 3.6.5（钉死版本，不再依赖镜像自带）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $opensslRoot = 'C:\openssl'
+          $ver = '3.6.5'
+          $verU = $ver.Replace('.', '_')
+
+          # 命中缓存（C:\openssl 已被 actions/cache 还原）就直接跳过下载安装
+          if (Test-Path (Join-Path $opensslRoot 'include\openssl\ssl.h')) {
+            Write-Host "OpenSSL $ver 命中缓存，跳过安装"
+          } else {
+            if (Test-Path $opensslRoot) { Remove-Item $opensslRoot -Recurse -Force }
+            $msi = Join-Path $env:RUNNER_TEMP "openssl-$verU.msi"
+            # 必须下「完整版」(由 $verU 拼出，如 Win64OpenSSL-3_6_5.msi)，Light 版不带 include/lib 开发文件
+            Invoke-WebRequest -Uri "https://slproweb.com/download/Win64OpenSSL-$verU.msi" `
+              -OutFile $msi -UserAgent 'Mozilla/5.0' -MaximumRetryCount 3 -RetryIntervalSec 10
+
+            # 校验下载物是合法 MSI（OLE 复合文档魔数 D0 CF 11 E0），防止拿到 HTML 错误页
+            $mb = (Get-Item $msi).Length / 1MB
+            Write-Host ("下载 OpenSSL MSI: {0:N1} MB" -f $mb)
+            if ($mb -lt 10) { throw "OpenSSL MSI 体积异常（$([int]$mb) MB），下载的多半是错误页而非安装包" }
+            $magic = Get-Content $msi -AsByteStream -TotalCount 4
+            if ($magic[0] -ne 0xD0 -or $magic[1] -ne 0xCF -or $magic[2] -ne 0x11 -or $magic[3] -ne 0xE0) {
+              throw '下载的 OpenSSL 文件不是合法 MSI（OLE 魔数不匹配），内容可能是 HTML 错误页'
+            }
+
+            $p = Start-Process -FilePath 'msiexec.exe' -Wait -PassThru -ArgumentList @(
+              '/i', $msi, '/quiet', '/qn', '/norestart', 'REBOOT=ReallySuppress', "INSTALLDIR=$opensslRoot"
+            )
+            if ($p.ExitCode -ne 0) {
+              throw "msiexec 安装 OpenSSL 失败，退出码 $($p.ExitCode)（0x$('{0:X}' -f $p.ExitCode)）"
+            }
+
+            if (-not (Test-Path (Join-Path $opensslRoot 'include\openssl\ssl.h'))) {
+              # INSTALLDIR 属性可能没生效（装到了默认路径），探测常见位置并搬过来
+              $candidates = @('C:\Program Files\OpenSSL', 'C:\Program Files\OpenSSL-Win64', 'C:\OpenSSL-Win64', 'C:\openssl-Win64')
+              $found = $candidates | Where-Object { Test-Path (Join-Path $_ 'include\openssl\ssl.h') } | Select-Object -First 1
+              if ($found) {
+                Write-Host "MSI 实际安装到了 $found，移动到 $opensslRoot"
+                if (Test-Path $opensslRoot) { Remove-Item $opensslRoot -Recurse -Force }
+                Move-Item $found $opensslRoot
+              } else {
+                Write-Host '未在常见位置找到 OpenSSL，列出系统里相关目录便于排查：'
+                foreach ($dir in @('C:\', 'C:\Program Files', 'C:\Program Files (x86)')) {
+                  Get-ChildItem $dir -Directory -ErrorAction SilentlyContinue |
+                    Where-Object Name -like '*OpenSSL*' |
+                    ForEach-Object { Write-Host "  $($_.FullName)" }
+                }
+                throw "OpenSSL $ver 安装后找不到开发头文件，安装可能失败（检查 slproweb 链接或换镜像）"
+              }
+            }
+          }
+
+          Write-Host "使用 OpenSSL: $opensslRoot"
+          "OPENSSL_ROOT_DIR=$opensslRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "OPENSSL_DIR=$opensslRoot"       | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: 打印本次使用的依赖版本
+        shell: pwsh
+        run: |
+          (Select-String -Path 'C:\local\boost_1_87_0\boost\version.hpp' -Pattern 'BOOST_LIB_VERSION').Line |
+            ForEach-Object { Write-Host "Boost   : $($_.Trim())" }
+          (Select-String -Path 'C:\local\boost_1_87_0\boost\version.hpp' -Pattern 'BOOST_VERSION ').Line |
+            ForEach-Object { Write-Host "Boost   : $($_.Trim())" }
+
+          Write-Host "MySQL   : $((& 'C:\tools\mysql\current\bin\mysql.exe' --version))"
+          Write-Host "OpenSSL : $((& 'C:\openssl\bin\openssl.exe' version))"
+          Write-Host "CMake   : $((& cmake --version | Select-Object -First 1))"
+          Write-Host "Ninja   : $((& ninja --version))"
+
+      # ------------------------------------------------------------------
+      # 3. ccache（注意：acore.sh 里 AC_CCACHE 默认是 false，必须在 config.sh 里显式打开）
+      # ------------------------------------------------------------------
+      # ccache 本体 runner 上没有，choco 装一下（会进 PATH，供 CMAKE_*_COMPILER_LAUNCHER 调用）
+      - name: 安装 ccache
+        shell: pwsh
+        run: choco install ccache -y --no-progress
+
+      # 缓存目录自己管：CCACHE_DIR 固定成 C:/ccache。
+      #
+      # ★ 这里刻意把 restore / save 拆成两个 action，而不是用 actions/cache@v4 一把梭：
+      #   actions/cache 内部是 main(restore) + post(save)，而它的 post 带 post-if: success()，
+      #   也就是**只要 job 最后是失败的，缓存就不保存**。而编译之后还有"整理最小产物包""上传"
+      #   等好几步，任何一步报错都会让 job 失败 → 白编译两小时，下次还得全量重来。
+      #   拆开之后 save 那步用 !cancelled() 兜住，编译过的目标文件一定存得下来。
+      #
+      #（之前用 hendrikmuhs/ccache-action，两次运行恢复缓存都报 400
+      #  Failed to restore: Cache service responded with 400，所以换回官方 action。）
+      - name: 恢复 ccache 编译缓存
+        id: ccache_restore
+        uses: actions/cache/restore@v4
+        with:
+          path: C:\ccache
+          key: coa-ccache-win-${{ inputs.core_ref }}-${{ inputs.module_ref }}-v4
+          restore-keys: |
+            coa-ccache-win-${{ inputs.core_ref }}-${{ inputs.module_ref }}-
+            coa-ccache-win-
+
+      # ★ 必须有这一步：actions/cache 在【缓存未命中】时不会创建 C:\ccache，
+      #   而 ccache 第一次运行时也不会自己把目录树建全，于是第一个文件开始编译就报
+      #     ccache: error: Failed to write to C:/ccache/cache.debug: No such file or directory
+      #   由于 ccache 是 CMAKE_*_COMPILER_LAUNCHER，它一挂整个 ninja 就停 —— exit 1。
+      #   （第一次跑、或换了 core_ref/module_ref 导致 key 变了，必然是未命中，所以必踩。）
+      #   做法：自己建目录 + 探一次可写性 + 让 ccache 真正初始化一遍；
+      #   只要有任何一步不过，就把 ccache 关掉继续编译，绝不为了一个缓存废掉 2 小时的构建。
+      - name: 准备 ccache 目录并自检
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = 'C:/ccache'
+
+          New-Item -ItemType Directory -Force -Path $dir          | Out-Null
+          New-Item -ItemType Directory -Force -Path "$dir/tmp"    | Out-Null
+
+          # 先自己试写一下，确认这个目录真的可写
+          $probe = "$dir/.write-probe"
+          Set-Content -Path $probe -Value 'ok' -Encoding ascii
+          Remove-Item $probe -Force -ErrorAction Stop
+          Write-Host "目录可写: $dir"
+
+          # 传给后面的 bash 步骤（acore.sh 读 CCACHE_DIR）
+          "CCACHE_DIR=$dir"          | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CCACHE_TEMPDIR=$dir/tmp"  | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CCACHE_MAXSIZE=2G"        | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          $env:CCACHE_DIR     = $dir
+          $env:CCACHE_TEMPDIR = "$dir/tmp"
+
+          Write-Host "ccache: $((& ccache --version 2>&1 | Select-Object -First 1))"
+
+          # 让 ccache 自己初始化（写 stats / tmp），这就是之前失败的那一下。
+          # 这里失败也不 throw，只是降级成"不用 ccache"继续编译。
+          $ok = $true
+          try {
+            $out = & ccache -z 2>&1
+            $out | Write-Host
+            if ($LASTEXITCODE -ne 0) { $ok = $false }
+          } catch {
+            Write-Warning "ccache -z 抛异常: $_"
+            $ok = $false
+          }
+
+          if (-not $ok) {
+            Write-Warning 'ccache 初始化失败，本次编译改用 AC_CCACHE=false（只是慢，不影响出包）'
+            'COA_CCACHE=false' | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          } else {
+            & ccache -s 2>&1 | Select-Object -First 12 | Write-Host
+            'COA_CCACHE=true' | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            Write-Host 'ccache 初始化成功，缓存目录 C:/ccache'
+          }
+
+      - name: 写入 acore.sh 编译配置 conf/config.sh
+        shell: bash
+        working-directory: C:\ac
+        run: |
+          mkdir -p conf
+          # 注意 <<'EOF' 要用引号：里面的 ${...} 要原样留着，等 acore.sh source 这个文件时再展开，
+          # 不能在这一步就被替换掉。GitHub 的模板表达式（CTA 那套 inputs / github 变量）是
+          # GitHub 在把脚本交给 bash 之前就替换好的，不受引号影响，照样能生效。
+          cat > conf/config.sh <<'EOF'
+          # 由 GitHub Actions 生成
+
+          # ★ 必须显式写成 Windows 风格路径，否则装错地方：
+          # acore.sh 默认 BINPATH="$AC_PATH_ROOT/env/dist"，而 AC_PATH_ROOT 在 git-bash 下是
+          # MSYS 风格（/c/ac）。它变成 -DCMAKE_INSTALL_PREFIX=/c/ac/env/dist 传给 cmake.exe 时，
+          # 带 -D 前缀的参数不会被 MSYS 自动转换成 Windows 路径，
+          # CMake 会把 /c/ac/env/dist 解释成 C:/c/ac/env/dist
+          # → exe 和 etc/ 全装到那儿，产物目录里只剩 acore.sh 拷过去的 startup-scripts 脚本。
+          BINPATH="C:/ac/env/dist"
+
+          CCOMPILERC="cl"
+          CCOMPILERCXX="cl"
+
+          CTYPE="Release"
+          CSCRIPTS="static"
+          CMODULES="static"
+          CAPPS_BUILD="all"
+          CTOOLS_BUILD="${{ inputs.build_tools == 'yes' && 'all' || 'none' }}"
+
+          # 自定义核心代码多，关掉警告避免噪音
+          CWARNINGS=OFF
+          CDEBUG=OFF
+          CBUILD_TESTING=OFF
+
+          # ---- ccache ----
+          # acore.sh 里 AC_CCACHE 默认是 false，必须显式打开。
+          # 开不开由工作流「准备 ccache 目录并自检」那一步决定：它自检失败就写 COA_CCACHE=false，
+          # 这里跟着降级。原因见那一步的注释 —— ccache 是 CMAKE_*_COMPILER_LAUNCHER，
+          # 它初始化失败会让 ninja 第一个文件就 exit 1，整个 2 小时的构建白跑。
+          AC_CCACHE="${COA_CCACHE:-true}"
+
+          # CCACHE_DIR / CCACHE_TEMPDIR / CCACHE_MAXSIZE 由那一步写进 GITHUB_ENV，这里只兜底。
+          export CCACHE_DIR="${CCACHE_DIR:-C:/ccache}"
+          export CCACHE_TEMPDIR="${CCACHE_TEMPDIR:-$CCACHE_DIR/tmp}"
+          export CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-2G}"
+
+          # 目录必须先存在。ccache 在缓存目录不存在时不会自己把目录树建全，
+          # 会直接 "Failed to write to <dir>/cache.debug: No such file or directory"，
+          # 而且因为它是编译器启动器，报错 = 编译直接停。
+          # （actions/cache 缓存未命中时不会创建目录，所以这一步是必需的。）
+          mkdir -p "$CCACHE_DIR" "$CCACHE_TEMPDIR" 2>/dev/null || true
+          echo "AC_CCACHE=$AC_CCACHE  CCACHE_DIR=$CCACHE_DIR"
+
+          CCUSTOMOPTIONS="-DBOOST_ROOT=C:/local/boost_1_87_0 -DOPENSSL_ROOT_DIR=C:/openssl -DOPENSSL_USE_STATIC_LIBS=FALSE -DCMAKE_RC_COMPILER=rc -DCMAKE_NINJA_FORCE_RESPONSE_FILE=ON -DCMAKE_NINJA_CMCLDEPS_RC=OFF -DCMAKE_C_USE_RESPONSE_FILE_FOR_OBJECTS=ON -DCMAKE_CXX_USE_RESPONSE_FILE_FOR_OBJECTS=ON -DCMAKE_C_USE_RESPONSE_FILE_FOR_INCLUDES=ON -DCMAKE_CXX_USE_RESPONSE_FILE_FOR_INCLUDES=ON -DCMAKE_C_USE_RESPONSE_FILE_FOR_LIBRARIES=ON -DCMAKE_CXX_USE_RESPONSE_FILE_FOR_LIBRARIES=ON"
+          EOF
+          echo '--- conf/config.sh ---'
+          cat conf/config.sh
+
+      # ------------------------------------------------------------------
+      # 4. 编译
+      # ------------------------------------------------------------------
+      - name: 启用 MSVC 环境
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
+        with:
+          arch: x64
+
+      - name: 编译（acore.sh compiler build = configure + compile + install）
+        shell: bash
+        working-directory: C:\ac
+        env:
+          CC: cl
+          CXX: cl
+        run: |
+          cmake --version
+          ninja --version
+          cl 2>&1 | head -n 2 || true
+
+          echo "AC_CCACHE=${COA_CCACHE:-true}  CCACHE_DIR=${CCACHE_DIR:-<unset>}"
+          command -v ccache && (ccache -s 2>&1 | head -n 12) || echo 'PATH 里没有 ccache'
+
+          rm -rf var/build/obj
+
+          LOG=/c/ac/build.log
+          : > "$LOG"
+
+          # 不用 -e，自己收 exit code，方便失败后按需重试
+          set +e
+
+          ./acore.sh compiler build 2>&1 | tee -a "$LOG"
+          status=${PIPESTATUS[0]}
+
+          # 兜底网：ccache 是 CMAKE_*_COMPILER_LAUNCHER，它初始化/写缓存失败会让
+          # ninja 在第一个文件就 exit 1，跟"代码编译不过"长得一模一样。
+          # 只在日志确实像 ccache 问题时才关掉 ccache 重跑一次（重跑代价只有 configure 那十几秒），
+          # 其它失败原因原样退出，不做无谓重试。
+          if [ "$status" -ne 0 ] && grep -qiE 'ccache[^\n]*(error|fatal|failed)|(failed|error) to (write|create)[^\n]*ccache|ccache[^\n]*No such file or directory' "$LOG"; then
+            echo "::warning::日志显示是 ccache 初始化/写缓存失败，关掉 ccache 重试一次（编译本身没问题，就是慢）"
+            sed -i 's/^AC_CCACHE=.*/AC_CCACHE="false"/' conf/config.sh
+            grep -n '^AC_CCACHE' conf/config.sh
+            rm -rf var/build/obj
+            ./acore.sh compiler build 2>&1 | tee -a "$LOG"
+            status=${PIPESTATUS[0]}
+          fi
+
+          echo '--- ccache 统计（cache hit / miss 一眼看出缓存有没有用上）---'
+          ccache -s 2>&1 | head -n 16 || true
+
+          if [ "$status" -eq 0 ]; then
+            echo '编译完成：exit 0'
+          else
+            echo "::error::编译失败（exit $status），下面摘出日志里的 error/fatal："
+            grep -inE 'error|fatal' "$LOG" | tail -n 40 || true
+          fi
+
+          exit "$status"
+
+      # ★ 编译一结束就把 ccache 存起来，而且 **失败也存**（!cancelled()）。
+      #   原因见上面 restore 那段的注释：actions/cache 的 post 是 success()，
+      #   后面任何一步报错都会把这两小时的编译成果连带缓存一起丢掉。
+      #   缓存已经命中（cache-hit == true）就不用重复存，跳过；
+      #   cache-primary-key 是 restore 那步解析出来的最终 key，两边必须一致，
+      #   否则存进去的缓存和下次要取的 key 对不上，等于没存。
+      - name: 保存 ccache 编译缓存（job 失败也保存）
+        if: ${{ !cancelled() && steps.ccache_restore.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: C:\ccache
+          key: ${{ steps.ccache_restore.outputs.cache-primary-key }}
+
+      # 双重保险：万一路径前缀还是被解释成别的形式，
+      # 这里把 exe / conf 找回来，别再出现"跑了 2 小时拿到一个空产物"。
+      - name: 确认安装位置（必要时把产物捞回 env/dist）
+        shell: pwsh
+        run: |
+          $dist = 'C:\ac\env\dist'
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+
+          if (Test-Path (Join-Path $dist 'worldserver.exe')) {
+            Write-Host 'OK: env/dist 里已有 worldserver.exe'
+            exit 0
+          }
+
+          Write-Warning 'env/dist 里没有 worldserver.exe，开始查找其它可能的安装位置'
+
+          $found = $false
+          foreach ($cand in @('C:\c\ac\env\dist', 'C:\ac\c\ac\env\dist', 'C:\ac\env\dist\bin')) {
+            if (Test-Path (Join-Path $cand 'worldserver.exe')) {
+              Write-Host "找到: $cand  -> 合并进 $dist"
+              robocopy $cand $dist /E /NFL /NDL /NJH /NJS /NP | Out-Null
+              $global:LASTEXITCODE = 0
+              $found = $true
+            }
+          }
+
+          if (-not $found) {
+            Write-Warning '候选目录里也没有，改从构建树里捞 exe / conf 兜底'
+            Get-ChildItem 'C:\ac\var\build' -Recurse -Include 'worldserver.exe','authserver.exe' -ErrorAction SilentlyContinue |
+              ForEach-Object { Copy-Item $_.FullName $dist -Force; Write-Host "  拷入 $($_.FullName)" }
+
+            $etc = Join-Path $dist 'etc'
+            if (-not (Test-Path $etc)) {
+              New-Item -ItemType Directory -Force -Path $etc | Out-Null
+              Get-ChildItem 'C:\ac\src' -Recurse -Filter '*.conf.dist' -ErrorAction SilentlyContinue |
+                ForEach-Object { Copy-Item $_.FullName $etc -Force }
+              Write-Host "  已从源码拷入 $((Get-ChildItem $etc -Filter '*.conf.dist').Count) 个 conf 模板"
+            }
+          }
+
+          Write-Host '--- env/dist 当前内容 ---'
+          Get-ChildItem $dist -Force | Select-Object Mode, Length, Name | Format-Table -AutoSize | Out-String | Write-Host
+
+      # ------------------------------------------------------------------
+      # 5. 产物（Windows 下 exe 直接落在 env/dist/，配置在 env/dist/etc/）
+      #    最终包 = 两个 exe + 运行时 DLL；conf / SQL / startup 脚本不打包。
+      # ------------------------------------------------------------------
+      - name: 查看产物
+        shell: bash
+        working-directory: C:\ac
+        run: |
+          ls -lh env/dist/*.exe 2>/dev/null || true
+          ls -lh env/dist/*.dll 2>/dev/null || true
+          ls -lh env/dist/etc 2>/dev/null || true
+          ls -lh env/dist/etc/modules 2>/dev/null || true
+
+          # 硬校验：没有 exe 就直接失败，绝不上传一个"看起来成功"的空包
+          if [ ! -f env/dist/worldserver.exe ] || [ ! -f env/dist/authserver.exe ]; then
+            echo "::error::env/dist 里没有 worldserver.exe / authserver.exe，编译安装环节有问题，不打包上传"
+            exit 1
+          fi
+
+          # 体积只打印，不做任何拦截。
+          # 经验：体积阈值只要定得偏一点点就会误杀（authserver.exe 本来就只有 1~3 MB），
+          # 而 job 一失败就要白等两小时重新全量编译 —— 代价远大于"万一传了个小包"。
+          DIST_MB=$(du -sm env/dist | cut -f1)
+          EXE_MB=$(du -cm env/dist/*.exe | tail -1 | cut -f1)
+          echo "env/dist 总计 ${DIST_MB} MB，其中 exe ${EXE_MB} MB"
+
+          {
+            echo "### 编译产物"
+            echo ""
+            echo "env/dist 总计 **${DIST_MB} MB**，其中 exe **${EXE_MB} MB**"
+            echo ""
+            ls -lh env/dist/*.exe env/dist/*.dll 2>/dev/null | awk '{print "- " $9 " (" $5 ")"}' || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # 5.5 把"这份 exe 对应哪个 commit"写进产物
+      #     SQL 和 exe 必须同版本：exe 会按 updates 表里记录的版本决定跑哪些更新，
+      #     本地 SQL 太旧会漏更新，太新会报 "requires newer core"。
+      #     worldserver 启动时打印的 AzerothCore rev. <hash> 就是这个 core_commit。
+      # ------------------------------------------------------------------
+      - name: 写入 BUILD_INFO.txt（本地源码对齐版本用）
+        shell: pwsh
+        run: |
+          $core = 'C:\ac'
+          $mod  = 'C:\ac\modules\mod-playerbots'
+
+          $coreHash = (git -C $core rev-parse HEAD).Trim()
+          $coreDate = (git -C $core log -1 --format=%cI).Trim()
+          $coreMsg  = ((git -C $core log -1 --format=%s).Trim())
+          $modHash  = (git -C $mod rev-parse HEAD).Trim()
+          $modDate  = (git -C $mod log -1 --format=%cI).Trim()
+
+          $lines = @(
+            'CoA + Playerbots build info'
+            '==========================='
+            "built_at      = $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')"
+            'runner        = windows-2022'
+            ''
+            'core_repo     = ${{ inputs.core_repo != '' && inputs.core_repo || github.repository }}'
+            'core_ref      = ${{ inputs.core_ref }}'
+            "core_commit   = $coreHash"
+            "core_date     = $coreDate"
+            "core_subject  = $coreMsg"
+            ''
+            'module_repo   = ${{ inputs.module_repo }}'
+            'module_ref    = ${{ inputs.module_ref }}'
+            "module_commit = $modHash"
+            "module_date   = $modDate"
+            ''
+            '--- 怎么用 ---'
+            '1) 本地那份源码要"对齐到这个 commit"，SQL 才和 exe 同版本：'
+            "   git -C <核心源码目录> fetch origin && git -C <核心源码目录> checkout $coreHash"
+            "   git -C <核心源码目录>/modules/mod-playerbots fetch origin && git -C <核心源码目录>/modules/mod-playerbots checkout $modHash"
+            '   （用 coa-playerbots-ci/tools/sync-db-source.ps1 -CoreCommit <hash> -ModuleCommit <hash> 可以一条命令搞定）'
+            '2) worldserver.conf 里 SourceDirectory 指向这份源码根目录，MySQLExecutable 指向 mysql.exe，'
+            '   Updates.EnableDatabases = 15（1+2+4+8，8 = playerbots 库）。'
+            '3) worldserver 启动日志里的 "AzerothCore rev. <hash>" 应当和 core_commit 一致。'
+          )
+          $out = 'C:\ac\env\dist\BUILD_INFO.txt'
+          $lines | Out-File -FilePath $out -Encoding utf8
+          Get-Content $out
+
+
+      # ------------------------------------------------------------------
+      # 5.6 补齐运行时 DLL：OpenSSL 因为 -DOPENSSL_USE_STATIC_LIBS=FALSE 是动态链接，
+      #     MySQL 客户端 libmysql.dll 也不在安装输出里 —— 编译器不会帮你拷，
+      #     缺了它们 exe 在别的机器上根本起不来。按候选来源找齐拷进 env/dist，
+      #     这样它们会随下面的原始产物一起交给 package 作业打最终包。
+      #     某个 DLL 找不到只警告、不拦截（别让一个 DLL 把两小时的编译废掉）。
+      # ------------------------------------------------------------------
+      - name: 补齐运行时 DLL（libmysql / OpenSSL / VC 运行库）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dist = 'C:\ac\env\dist'
+
+          # 各 DLL 的候选来源，按顺序取第一个命中的
+          $candidates = [ordered]@{
+            'libmysql.dll'       = @('C:\tools\mysql\current\lib', 'C:\tools\mysql\current\bin')
+            'libcrypto-3-x64.dll'= @('C:\openssl\bin', 'C:\Program Files\OpenSSL\bin', 'C:\Program Files\OpenSSL-Win64\bin')
+            'libssl-3-x64.dll'   = @('C:\openssl\bin', 'C:\Program Files\OpenSSL\bin', 'C:\Program Files\OpenSSL-Win64\bin')
+            'legacy.dll'         = @('C:\openssl\bin', 'C:\Program Files\OpenSSL\bin', 'C:\Program Files\OpenSSL-Win64\bin')
+            'vcruntime140.dll'   = @('C:\Windows\System32')
+            'vcruntime140_1.dll' = @('C:\Windows\System32')
+            'msvcp140.dll'       = @('C:\Windows\System32')
+          }
+
+          foreach ($name in $candidates.Keys) {
+            if (Test-Path (Join-Path $dist $name)) { Write-Host "env/dist 已有 $name，跳过"; continue }
+            $src = @($candidates[$name]) |
+              Where-Object { Test-Path (Join-Path $_ $name) } |
+              Select-Object -First 1
+            if ($src) {
+              Copy-Item (Join-Path $src $name) $dist -Force
+              Write-Host ("拷入 {0}  <-  {1}" -f $name, (Join-Path $src $name))
+            } else {
+              Write-Warning "没找到 $name（只提醒不拦截，最终包会缺它）"
+            }
+          }
+
+          # 把两个 exe 的真实依赖打印出来，缺哪个 DLL 一目了然
+          if (Get-Command dumpbin -ErrorAction SilentlyContinue) {
+            foreach ($exe in @('worldserver.exe', 'authserver.exe')) {
+              $p = Join-Path $dist $exe
+              if (Test-Path $p) {
+                Write-Host "--- 依赖：$exe ---"
+                & dumpbin /DEPENDENTS $p 2>&1 |
+                  Select-String -Pattern '\.dll' |
+                  ForEach-Object { Write-Host ('    ' + $_.Line.Trim()) }
+              }
+            }
+          } else {
+            Write-Warning 'PATH 里没有 dumpbin，跳过依赖列表（不影响产物）'
+          }
+
+          Write-Host '--- env/dist 里的 DLL ---'
+          Get-ChildItem (Join-Path $dist '*.dll') -ErrorAction SilentlyContinue |
+            Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
+
+      # ------------------------------------------------------------------
+      # 6.5 把编译原始产物（整个 env/dist）先存一份到 Artifacts
+      #     为什么多传这一份：下面「整理最终产物包」是另一个作业（package）在干，
+      #     它要是出了问题，点 Re-run failed jobs 就能只重跑它 —— 而它能重跑的前提
+      #     就是这里的原始产物还在。runner 是本作业跑完就销毁的临时机器，
+      #     编译成果不落成 artifact 就等于没有。
+      #     保留 7 天，够你慢慢折腾；最终交付包还是那个干净的最小包。
+      # ------------------------------------------------------------------
+      - name: 上传编译原始产物（重跑打包作业的前提）
+        id: upload_raw
+        uses: actions/upload-artifact@v4
+        with:
+          name: coa-raw-dist-r${{ github.run_number }}
+          path: C:\ac\env\dist
+          if-no-files-found: error
+          retention-days: 7
+          # exe 已经是压缩过的 PE 文件，再压收益很小，用最低档换速度
+          compression-level: 1
+          # 重跑本作业时会撞同名，必须覆盖（否则重跑直接挂在这一步）
+          overwrite: true
+
+
+      # ------------------------------------------------------------------
+      # 6. 数据库源目录：worldserver 启动时按它去找 SQL 做自动更新
+      # ------------------------------------------------------------------
+      # 云编译的 exe 里"烘焙"的源码路径是 runner 上的 C:\ac，在你自己电脑上并不存在，
+      # 所以必须把一份 SQL 目录放到本地，再用 worldserver.conf 的 SourceDirectory 指过去。
+      # 这里按 exe 实际编译的那份源码打包，保证 SQL 和 exe 版本次次对应。
+      # 默认不打包（输入项 db_source = no）：241MB 全是 SQL，本地留一份源码就够用了。
+      - name: 打包数据库源目录（worldserver 自动更新用）
+        if: ${{ inputs.db_source == 'yes' }}
+        shell: pwsh
+        run: |
+          function Copy-SqlTree {
+            param([string]$Src, [string]$Dst, [string[]]$Exclude)
+            if (-not (Test-Path $Src)) { Write-Host "跳过（源码里没有）: $Src"; return }
+            $a = @($Src, $Dst, '/E', '/NFL', '/NDL', '/NJH', '/NJS', '/NP')
+            if ($Exclude) { $a += '/XD'; $a += $Exclude }
+            & robocopy @a | Out-Null
+            # robocopy 的 0~7 都算成功，8 以上才是失败
+            if ($LASTEXITCODE -ge 8) { throw "robocopy 失败(exit $LASTEXITCODE): $Src" }
+            $global:LASTEXITCODE = 0
+          }
+
+          $pkg = 'C:\dbpkg'
+          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
+
+          # data/sql/old 没有被任何 updates_include 引用，跳过省 280MB
+          Copy-SqlTree 'C:\ac\data\sql' "$pkg\data\sql" @('C:\ac\data\sql\old')
+          # 首次建世界库用的 CoA 世界数据包，以及导入工具
+          Copy-SqlTree 'C:\ac\data\coa-world' "$pkg\data\coa-world"
+          Copy-SqlTree 'C:\ac\apps\coa-world' "$pkg\apps\coa-world"
+          # 每个模块的 data/sql（含 mod-playerbots 的 playerbots / world / characters）
+          foreach ($m in Get-ChildItem 'C:\ac\modules' -Directory) {
+            Copy-SqlTree (Join-Path $m.FullName 'data\sql') "$pkg\modules\$($m.Name)\data\sql"
+          }
+
+          # 把编译信息一起打进去：解压后先看这个文件，就知道该把本地源码对齐到哪个 commit
+          $info = 'C:\ac\env\dist\BUILD_INFO.txt'
+          if (Test-Path $info) { Copy-Item $info "$pkg\BUILD_INFO.txt" -Force }
+
+          $zip      = Join-Path $env:RUNNER_TEMP 'coa-db-source.zip'
+          $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
+          Push-Location $pkg
+          if (Test-Path $sevenZip) {
+            & $sevenZip a -tzip -mx=5 -bso0 -bsp0 $zip 'data' 'apps' 'modules' | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "7-Zip 打包失败(exit $LASTEXITCODE)" }
+          } else {
+            Compress-Archive -Path 'data', 'apps', 'modules' -DestinationPath $zip -CompressionLevel Optimal
+          }
+          Pop-Location
+          $global:LASTEXITCODE = 0
+
+          "DB_PKG_ZIP=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $info = Get-Item $zip
+          Write-Host ("数据库源目录已打包: {0:N1} MB" -f ($info.Length / 1MB))
+          $summary = @()
+          $summary += '### 数据库源目录'
+          $summary += ''
+          $summary += ('- coa-db-source-r{0}.zip（{1:N0} MB）：解压后把 worldserver.conf 里的 SourceDirectory 指向它，worldserver 就会自己更新数据库' -f ${{ github.run_number }}, ($info.Length / 1MB))
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: 上传数据库源目录
+        if: ${{ inputs.db_source == 'yes' }}
+        id: upload_db
+        uses: actions/upload-artifact@v4
+        with:
+          name: coa-db-source-r${{ github.run_number }}
+          path: ${{ env.DB_PKG_ZIP }}
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+          overwrite: true
+
+      # 把编译阶段传上去的东西钉在摘要里。这两个包在重跑时都还在，
+      # package 作业正是靠 coa-raw-dist 干活。
+      - name: 记录编译阶段的上传结果
+        shell: pwsh
+        run: |
+          $lines = @('### 编译阶段产物', '')
+          $rawName = 'coa-raw-dist-r${{ github.run_number }}'
+          $rawUrl  = '${{ steps.upload_raw.outputs.artifact-url }}'
+          $rawDig  = '${{ steps.upload_raw.outputs.artifact-digest }}'
+
+          if ([string]::IsNullOrWhiteSpace($rawUrl)) {
+            $lines += '- ❌ **' + $rawName + '**：artifact-url 为空，没传上去'
+          } else {
+            $lines += '- ✅ **' + $rawName + '** —— 编译原始产物（供打包作业使用，7 天内请勿删除）'
+            $lines += '    - SHA-256: ' + $rawDig
+            $lines += '    - 下载: ' + $rawUrl
+          }
+
+          if ('${{ inputs.db_source }}' -eq 'yes') {
+            $dbName = 'coa-db-source-r${{ github.run_number }}'
+            $dbUrl  = '${{ steps.upload_db.outputs.artifact-url }}'
+            $dbDig  = '${{ steps.upload_db.outputs.artifact-digest }}'
+            if ([string]::IsNullOrWhiteSpace($dbUrl)) {
+              $lines += '- ❌ **' + $dbName + '**：artifact-url 为空，没传上去'
+            } else {
+              $lines += '- ✅ **' + $dbName + '**'
+              $lines += '    - SHA-256: ' + $dbDig
+              $lines += '    - 下载: ' + $dbUrl
+            }
+          }
+
+          $lines += @('', '> 接下来由 **package (打包)** 作业挑出两个 exe + 运行时 DLL 生成最终产物。')
+          $lines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          $lines | Where-Object { $_ -ne '' } | ForEach-Object { Write-Host $_ }
+
+          if ([string]::IsNullOrWhiteSpace($rawUrl)) {
+            throw '编译原始产物没上传成功（拿不到 artifact-url），打包作业会没东西可用'
+          }
+          Write-Host '编译原始产物已确认上传成功。'
+
+
+
+  # ===========================================================================
+  # 打包作业：从编译作业的原始产物里挑出两个 exe 做成最终包（几十秒）。
+  #
+  # 单独拆出来就是为了解决「打包失败还要重新编译两小时」：
+  #   这一作业失败时，在运行页面右上角选 Re-run jobs → **Re-run failed jobs**，
+  #   只会重跑这一个作业；编译作业是成功的，不会重跑，它上传的 artifact
+  #   在重跑中也依然可用（GitHub 官方文档明文说明）。
+  #   ⚠ 别点 "Re-run all jobs" —— 那个会把编译一起重来。
+  # ===========================================================================
+  package:
+    name: package (打包，可单独重跑)
+    needs: build
+    runs-on: windows-2022
+    # 打包本身很快，给足余量即可；真卡住也不会占着 runner 一小时
+    timeout-minutes: 30
+    steps:
+      # 把编译作业传上来的原始产物取回来。同一个 run 内，用名字即可。
+      - name: 取回编译原始产物
+        uses: actions/download-artifact@v4
+        with:
+          name: coa-raw-dist-r${{ github.run_number }}
+          path: C:\ac\env\dist
+
+      - name: 确认取到的产物
+        shell: pwsh
+        run: |
+          Write-Host '--- 取回的 env/dist ---'
+          Get-ChildItem 'C:\ac\env\dist' -File |
+            Sort-Object Name | Select-Object Name, Length |
+            Format-Table -AutoSize | Out-String | Write-Host
+          foreach ($n in @('authserver.exe', 'worldserver.exe')) {
+            if (Test-Path (Join-Path 'C:\ac\env\dist' $n)) {
+              Write-Host "OK   $n"
+            } else {
+              Write-Warning "取回的产物里没有 $n（照常往下走，不加拦截）"
+            }
+          }
+
+      # ------------------------------------------------------------------
+      # 7. 打"能跑起来的最小集合"
+      #     env/dist 里其实还有 etc/ 配置模板、acore.sh 拷进去的 startup 脚本等；
+      #     本地既然留了一份源码当 SQL 源，这些模板就已经有了，不必再重复下几十 MB。
+      #     所以这里挑出 authserver.exe + worldserver.exe + 运行时 DLL
+      #     另存到 C:\ac\pkg，只上传它。
+      #     想换回整包：把下面"上传产物"的 path 改回 C:\ac\env\dist 即可。
+      # ------------------------------------------------------------------
+      - name: 整理最终产物包（两个 exe + 运行时 DLL）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dist = 'C:\ac\env\dist'
+          $pkg  = 'C:\ac\pkg'
+
+          if (Test-Path $pkg) { Remove-Item $pkg -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
+
+          # 两个 exe 是刚需，缺一个就直接失败
+          foreach ($n in @('authserver.exe', 'worldserver.exe')) {
+            $f = Join-Path $dist $n
+            if (-not (Test-Path $f)) { throw "$dist 里没有 $n，无法打包" }
+            Copy-Item $f $pkg -Force
+          }
+
+          # 运行时 DLL 全部带上（libmysql / libcrypto-3-x64 / libssl-3-x64 / legacy 等）；
+          # 一个都没有也只警告不拦截 —— 别让一个 DLL 把两小时的编译废掉
+          $dlls = @(Get-ChildItem (Join-Path $dist '*.dll') -File -ErrorAction SilentlyContinue)
+          if ($dlls.Count -eq 0) {
+            Write-Warning 'env/dist 里一个运行时 DLL 都没有，最终包只有两个 exe（新机器上会缺库）'
+          } else {
+            $dlls | ForEach-Object { Copy-Item $_.FullName $pkg -Force }
+          }
+
+          $files = @(Get-ChildItem $pkg -File | Sort-Object Name)
+
+          # 体积只打印、不判断（authserver.exe 本来就小，别设体积门槛误杀）
+          foreach ($n in @('worldserver.exe', 'authserver.exe')) {
+            $f = Get-Item (Join-Path $pkg $n)
+            Write-Host ('{0,-18} {1,8:N2} MB' -f $f.Name, ($f.Length / 1MB))
+          }
+          Write-Host ("包内 DLL 共 {0} 个：{1}" -f $dlls.Count, (($dlls | ForEach-Object Name) -join ', '))
+
+          $mb = ($files | Measure-Object Length -Sum).Sum / 1MB
+          Write-Host ("共打包 {0} 个文件（2 个 exe + {1} 个 DLL），合计 {2:N2} MB" -f $files.Count, $dlls.Count, $mb)
+
+          $summary = @(
+            '### 最小产物包',
+            '',
+            ('含 **authserver.exe + worldserver.exe + 运行时 DLL**，共 **{0:N2} MB**，{1} 个文件' -f $mb, $files.Count),
+            '',
+            '| 文件 | 大小 |',
+            '|---|---|'
+          )
+          $summary += @($files | ForEach-Object { '| `{0}` | {1:N2} MB |' -f $_.Name, ($_.Length / 1MB) })
+          $summary += @('', '> 注意：本包不含配置文件。`worldserver.conf` / `authserver.conf` / `playerbots.conf` 要从本地源码复制（去掉 `.dist` 后缀），并修改 `SourceDirectory` / `MySQLExecutable` / `Updates.EnableDatabases` 三处。')
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: 上传产物
+        id: upload_server
+        uses: actions/upload-artifact@v4
+        with:
+          name: coa-server-windows-r${{ github.run_number }}
+          # 只传最终包 C:\ac\pkg（两个 exe + DLL）；要整包就改成 C:\ac\env\dist
+          path: C:\ac\pkg
+          if-no-files-found: error
+          retention-days: 30
+          # exe 已是压缩过的 PE，无需高压缩比，用低档换上传速度
+          compression-level: 1
+          # 同一次运行里点 "Re-run all jobs" 会撞上同名 artifact，v4 默认直接失败。
+          # 打开 overwrite 覆盖旧的，避免"好不容易跑完 2 小时，重跑却挂在上传这一步"。
+          overwrite: true
+
+      # ★ 最后一步：把"到底传上去了什么"钉死在运行摘要里。
+      #   upload-artifact 的 artifact-url / artifact-digest 只有在**真正上传成功**时才有值，
+      #   为空就说明包其实没上去。以前"步骤是绿的、Artifacts 里却找不到包"的情况，
+      #   从这里就能立刻分辨：要么直接报错，要么留下一串可点开的下载链接 + SHA-256。
+      - name: 记录上传结果（Artifacts 链接与校验和）
+        shell: pwsh
+        run: |
+          $lines = @('### 最终产物（authserver.exe + worldserver.exe + 运行时 DLL）', '')
+          $name1 = 'coa-server-windows-r${{ github.run_number }}'
+          $url1  = '${{ steps.upload_server.outputs.artifact-url }}'
+          $dig1  = '${{ steps.upload_server.outputs.artifact-digest }}'
+          $id1   = '${{ steps.upload_server.outputs.artifact-id }}'
+
+          if ([string]::IsNullOrWhiteSpace($url1)) {
+            $lines += '- ❌ **' + $name1 + '**：artifact-url 为空 —— 这个包并没有真正上传成功'
+          } else {
+            $lines += '- ✅ **' + $name1 + '**（artifact id ' + $id1 + '）'
+            $lines += '    - SHA-256: ' + $dig1
+            $lines += '    - 下载: ' + $url1
+          }
+
+          $lines += @('', '> 上面的链接就是该次运行的 Artifacts（需登录 GitHub 才能下载）。', '> 运行页面**最下方**的 Artifacts 区块里也能看到同名条目。')
+          $lines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          $lines | Where-Object { $_ -ne '' } | ForEach-Object { Write-Host $_ }
+
+          if ([string]::IsNullOrWhiteSpace($url1)) {
+            throw '上传产物后没拿到 artifact-url，判定为上传失败（Artifacts 里不会有包）'
+          }
+          Write-Host '最终产物已确认上传成功。'

@@ -1,0 +1,589 @@
+##############################################################################
+# 【可复用工作流】CoA 双线云编译（Windows）—— COA 线与 A52 线共用
+#
+# 入口（Tasks 里各有一个按钮）：
+#   build-coa-windows.yml  → "Build COA (Windows)"   COA / Wildcard / Reborn 三模式
+#   build-a52-windows.yml  → "Build A52 (Windows)"   FreePick / Hero 两模式
+#
+# 说明：**五种模式共用同一份二进制**。模式差异全在 worldserver.conf / coa.conf /
+#       playerbots.conf 里（端口、RealmType、等级上限、bots 数量），所以云端只需要
+#       按「两条代码线」各编一次，不需要按模式编五次。
+#
+# 依赖（两条线统一，避免合并 Repack 时冲突）：
+#   MySQL 客户端 8.4.13 —— 硬约束：核心 DatabaseWorkerPool 要求
+#       mysql_get_client_version() == MYSQL_VERSION_ID，不一致直接 ACE00046 退出。
+#       包里自带 8.4.13 的 libmysql.dll，和 exe 配套。
+#   OpenSSL 3.6.5 / Boost 1.87 / RelWithDebInfo / SCRIPTS+MODULES static
+#
+# 产物：<tag>-server-windows-rXX.zip = authserver.exe + worldserver.exe + 运行时 DLL
+#       + BUILD_INFO.txt + SHA256SUMS.txt。下载后丢进 E:\Coa Compile\out\<tag>\
+#       再由 tools\merge-repack.ps1 合并。
+##############################################################################
+name: _CoA profile build (Windows)
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: '配置：coa 或 a52'
+        required: true
+        type: string
+      core_repo:
+        description: '核心仓库 owner/repo，留空 = 该 profile 的默认仓库'
+        required: false
+        type: string
+        default: ''
+      core_ref:
+        description: '核心分支/标签/commit，留空 = main'
+        required: false
+        type: string
+        default: ''
+      module_repo:
+        description: 'mod-playerbots 仓库，留空 = 该 profile 默认'
+        required: false
+        type: string
+        default: ''
+      module_ref:
+        description: 'mod-playerbots 分支，留空 = 该 profile 默认'
+        required: false
+        type: string
+        default: ''
+      build_type:
+        description: '构建类型'
+        required: false
+        type: string
+        default: 'RelWithDebInfo'
+      build_tools:
+        description: '是否同时编译地图提取工具'
+        required: false
+        type: string
+        default: 'no'
+      db_source:
+        description: '是否打包 SQL 源目录（约 240MB）'
+        required: false
+        type: string
+        default: 'no'
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    name: setup
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.r.outputs.tag }}
+      core_repo: ${{ steps.r.outputs.core_repo }}
+      core_ref: ${{ steps.r.outputs.core_ref }}
+      module_repo: ${{ steps.r.outputs.module_repo }}
+      module_ref: ${{ steps.r.outputs.module_ref }}
+      modes: ${{ steps.r.outputs.modes }}
+    steps:
+      - name: 解析默认值
+        id: r
+        shell: bash
+        env:
+          IN_PROFILE: ${{ inputs.profile }}
+          IN_CORE_REPO: ${{ inputs.core_repo }}
+          IN_CORE_REF: ${{ inputs.core_ref }}
+          IN_MODULE_REPO: ${{ inputs.module_repo }}
+          IN_MODULE_REF: ${{ inputs.module_ref }}
+        run: |
+          set -euo pipefail
+          case "$IN_PROFILE" in
+            coa) TAG='coa'; DEF_CORE='Conquest-of-AzerothCore/azerothcore-wotlk-coa'; DEF_MOD='Zyth45/mod-playerbots'; DEF_MOD_REF='coa';    MODES='COA / Wildcard / Reborn' ;;
+            a52) TAG='a52'; DEF_CORE='CWO4PapaBear/azerothcore-wotlk-coa';           DEF_MOD='Brytenwally/mod-playerbots'; DEF_MOD_REF='area52-freepick'; MODES='FreePick / Hero' ;;
+            *) echo "::error::未知 profile: $IN_PROFILE（只能是 coa 或 a52）"; exit 1 ;;
+          esac
+
+          {
+            echo "tag=$TAG"
+            echo "core_repo=${IN_CORE_REPO:-$DEF_CORE}"
+            echo "core_ref=${IN_CORE_REF:-main}"
+            echo "module_repo=${IN_MODULE_REPO:-$DEF_MOD}"
+            echo "module_ref=${IN_MODULE_REF:-$DEF_MOD_REF}"
+            echo "modes=$MODES"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### 本次编译：$TAG（$MODES）"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| core | \`${IN_CORE_REPO:-$DEF_CORE}@${IN_CORE_REF:-main}\` |"
+            echo "| module | \`${IN_MODULE_REPO:-$DEF_MOD}@${IN_MODULE_REF:-$DEF_MOD_REF}\` |"
+            echo "| 构建类型 | \`${{ inputs.build_type }}\` |"
+            echo "| MySQL 客户端 | \`8.4.13\`（与包内 libmysql.dll 配套） |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: build (编译)
+    needs: setup
+    runs-on: windows-2022
+    timeout-minutes: 355
+    concurrency:
+      group: coa-build-win-${{ needs.setup.outputs.tag }}-${{ github.ref }}
+      cancel-in-progress: false
+    env:
+      BOOST_ROOT: C:\local\boost_1_87_0
+      CMAKE_GENERATOR: Ninja
+      MYSQL_VERSION: 8.4.13
+      OPENSSL_VERSION: 3.6.5
+      BOOST_VERSION: 1.87.0
+    steps:
+      - name: 拉取核心源码
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.setup.outputs.core_repo }}
+          ref: ${{ needs.setup.outputs.core_ref }}
+          path: a
+          fetch-depth: 1
+
+      - name: 拉取 mod-playerbots
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.setup.outputs.module_repo }}
+          ref: ${{ needs.setup.outputs.module_ref }}
+          path: a/modules/mod-playerbots
+          fetch-depth: 1
+
+      - name: 移动到短路径 C:\ac
+        shell: pwsh
+        run: |
+          if (Test-Path C:\ac) { Remove-Item C:\ac -Recurse -Force }
+          New-Item -ItemType Directory -Path C:\ac | Out-Null
+          robocopy "${{ github.workspace }}\a" "C:\ac" /MIR /NFL /NDL /NJH /NJS /NP
+          if ($LASTEXITCODE -le 7) { exit 0 }
+          exit $LASTEXITCODE
+
+      - name: 记录版本
+        shell: bash
+        run: |
+          {
+            echo "### 实际编译的提交"
+            echo ""
+            echo "| 来源 | commit |"
+            echo "|---|---|"
+            echo "| core | \`$(git -C /c/ac rev-parse --short HEAD)\` |"
+            echo "| mod  | \`$(git -C /c/ac/modules/mod-playerbots rev-parse --short HEAD)\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 缓存 Boost
+        uses: actions/cache@v4
+        with:
+          path: C:\local\boost_1_87_0
+          key: win-deps-boost-1.87.0
+
+      - name: 缓存 MySQL 客户端
+        uses: actions/cache@v4
+        with:
+          path: C:\tools\mysql\current
+          key: win-deps-mysql-8.4.13-v1
+
+      - name: 缓存 Win64 OpenSSL
+        uses: actions/cache@v4
+        with:
+          path: C:\openssl
+          key: win-deps-openssl-3.6.5
+
+      - name: 安装 Ninja 与 Boost 1.87
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco install ninja -y --no-progress
+
+          if (Test-Path 'C:\local\boost_1_87_0\boost\version.hpp') {
+            Write-Host 'Boost 命中缓存'
+            exit 0
+          }
+          choco install boost-msvc-14.3 --version=1.87.0 -y --no-progress
+          if (Test-Path 'C:\local\boost_1_87_0\boost\version.hpp') { exit 0 }
+
+          $exe = Join-Path $env:RUNNER_TEMP 'boost.exe'
+          Invoke-WebRequest -Uri 'https://downloads.sourceforge.net/project/boost/boost-binaries/1.87.0/boost_1_87_0-msvc-14.3-64.exe' `
+            -OutFile $exe -UserAgent 'coa-ci' -MaximumRetryCount 3 -RetryIntervalSec 15
+          Start-Process -FilePath $exe -Wait -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/DIR=C:\local\boost_1_87_0')
+          if (-not (Test-Path 'C:\local\boost_1_87_0\boost\version.hpp')) { throw 'Boost 安装失败' }
+
+      - name: 安装 MySQL 8.4.13 客户端库
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver = $env:MYSQL_VERSION
+          $cur = 'C:\tools\mysql\current'
+
+          if (-not (Test-Path "$cur\lib\mysqlclient.lib")) {
+            $url = "https://cdn.mysql.com/Downloads/MySQL-8.4/mysql-$ver-winx64.zip"
+            $zip = Join-Path $env:RUNNER_TEMP 'mysql.zip'
+            Invoke-WebRequest -Uri $url -OutFile $zip -UserAgent 'Mozilla/5.0' -MaximumRetryCount 3 -RetryIntervalSec 10
+            if ((Get-Item $zip).Length -lt 50MB) { throw 'MySQL 包体积异常，下载的多半是错误页' }
+
+            New-Item -ItemType Directory -Force -Path 'C:\tools\mysql' | Out-Null
+            if (Test-Path 'C:\tools\mysql') { Get-ChildItem 'C:\tools\mysql' -Directory | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue }
+            Expand-Archive -Path $zip -DestinationPath 'C:\tools\mysql' -Force
+            $dir = Get-ChildItem 'C:\tools\mysql' -Directory -Filter "mysql-$ver-*" | Select-Object -First 1
+            if (-not $dir) { throw "解压后没找到 mysql-$ver-winx64" }
+            Rename-Item $dir.FullName $cur
+          }
+
+          # 版本硬断言：缓存或旧版本残留会让 exe 与 libmysql.dll 版本对不上（ACE00046）
+          $actual = $null
+          $vh = "$cur\include\mysql_version.h"
+          if (Test-Path $vh) {
+            $idLine = Select-String -Path $vh -Pattern '^#define\s+MYSQL_VERSION_ID\s+(\d+)' | Select-Object -First 1
+            if ($idLine) {
+              $id = [int]$idLine.Matches[0].Groups[1].Value
+              $actual = '{0}.{1}.{2}' -f ([math]::Floor($id / 10000)), ([math]::Floor(($id % 10000) / 100)), ($id % 100)
+            }
+          }
+          if (-not $actual) { throw '无法判定 MySQL 版本' }
+          Write-Host "MySQL 客户端: $actual（期望 $ver）"
+          if ($actual -ne $ver) { throw "MySQL 实际 $actual，不是 $ver —— 请把缓存 key 后缀改掉强制重下" }
+
+      - name: 安装 Win64 OpenSSL 3.6.5
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = 'C:\openssl'
+          $ver = $env:OPENSSL_VERSION
+          $verU = $ver.Replace('.', '_')
+
+          if (-not (Test-Path "$root\include\openssl\ssl.h")) {
+            if (Test-Path $root) { Remove-Item $root -Recurse -Force }
+            $msi = Join-Path $env:RUNNER_TEMP "openssl-$verU.msi"
+            Invoke-WebRequest -Uri "https://slproweb.com/download/Win64OpenSSL-$verU.msi" -OutFile $msi -UserAgent 'Mozilla/5.0' -MaximumRetryCount 3 -RetryIntervalSec 10
+            if ((Get-Item $msi).Length -lt 10MB) { throw 'OpenSSL MSI 体积异常' }
+            $magic = Get-Content $msi -AsByteStream -TotalCount 4
+            if ($magic[0] -ne 0xD0 -or $magic[1] -ne 0xCF -or $magic[2] -ne 0x11 -or $magic[3] -ne 0xE0) { throw '不是合法 MSI' }
+
+            $p = Start-Process -FilePath 'msiexec.exe' -Wait -PassThru -ArgumentList @('/i', $msi, '/quiet', '/qn', '/norestart', 'REBOOT=ReallySuppress', "INSTALLDIR=$root")
+            if ($p.ExitCode -ne 0) { throw "msiexec 失败: $($p.ExitCode)" }
+            if (-not (Test-Path "$root\include\openssl\ssl.h")) {
+              $found = @('C:\Program Files\OpenSSL', 'C:\Program Files\OpenSSL-Win64') | Where-Object { Test-Path (Join-Path $_ 'include\openssl\ssl.h') } | Select-Object -First 1
+              if (-not $found) { throw 'OpenSSL 安装后找不到头文件' }
+              Move-Item $found $root
+            }
+          }
+          "OPENSSL_ROOT_DIR=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: 打印依赖版本
+        shell: pwsh
+        run: |
+          Write-Host "MySQL   : $((& 'C:\tools\mysql\current\bin\mysql.exe' --version))"
+          Write-Host "OpenSSL : $((& 'C:\openssl\bin\openssl.exe' version))"
+          Write-Host "CMake   : $((& cmake --version | Select-Object -First 1))"
+
+      - name: 安装 ccache
+        shell: pwsh
+        run: choco install ccache -y --no-progress
+
+      # restore/save 拆开：actions/cache 的 post 是 success()，后面任何一步失败都会连缓存一起丢
+      - name: 恢复 ccache
+        id: ccache_restore
+        uses: actions/cache/restore@v4
+        with:
+          path: C:\ccache
+          key: coa-ccache-win-${{ needs.setup.outputs.tag }}-${{ inputs.build_type }}-${{ needs.setup.outputs.core_ref }}-${{ needs.setup.outputs.module_ref }}-v1
+          restore-keys: |
+            coa-ccache-win-${{ needs.setup.outputs.tag }}-${{ inputs.build_type }}-
+            coa-ccache-win-${{ needs.setup.outputs.tag }}-
+            coa-ccache-win-
+
+      - name: 准备 ccache 目录并自检
+        shell: pwsh
+        run: |
+          $dir = 'C:/ccache'
+          New-Item -ItemType Directory -Force -Path $dir       | Out-Null
+          New-Item -ItemType Directory -Force -Path "$dir/tmp" | Out-Null
+          Set-Content -Path "$dir/.probe" -Value 'ok' -Encoding ascii
+          Remove-Item "$dir/.probe" -Force
+
+          "CCACHE_DIR=$dir"         | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CCACHE_TEMPDIR=$dir/tmp" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CCACHE_MAXSIZE=2G"       | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $env:CCACHE_DIR = $dir; $env:CCACHE_TEMPDIR = "$dir/tmp"
+
+          $ok = $true
+          try { & ccache -z 2>&1 | Write-Host; if ($LASTEXITCODE -ne 0) { $ok = $false } } catch { $ok = $false }
+          if ($ok) { 'COA_CCACHE=true' | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8 }
+          else {
+            Write-Warning 'ccache 初始化失败，改用 AC_CCACHE=false'
+            'COA_CCACHE=false' | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+
+      - name: 写入 conf/config.sh
+        shell: bash
+        working-directory: C:\ac
+        run: |
+          mkdir -p conf
+          cat > conf/config.sh <<'EOF'
+          # 由 GitHub Actions 生成
+          # BINPATH 必须写 Windows 绝对路径，否则 CMake 会把 /c/ac/env/dist 解释成 C:/c/ac/env/dist
+          BINPATH="C:/ac/env/dist"
+
+          CCOMPILERC="cl"
+          CCOMPILERCXX="cl"
+
+          CTYPE="${{ inputs.build_type }}"
+          CSCRIPTS="static"
+          CMODULES="static"
+          CAPPS_BUILD="all"
+          CTOOLS_BUILD="${{ inputs.build_tools == 'yes' && 'all' || 'none' }}"
+
+          CWARNINGS=OFF
+          CDEBUG=OFF
+          CBUILD_TESTING=OFF
+
+          AC_CCACHE="${COA_CCACHE:-true}"
+
+          export CCACHE_DIR="${CCACHE_DIR:-C:/ccache}"
+          export CCACHE_TEMPDIR="${CCACHE_TEMPDIR:-$CCACHE_DIR/tmp}"
+          export CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-2G}"
+          mkdir -p "$CCACHE_DIR" "$CCACHE_TEMPDIR" 2>/dev/null || true
+          echo "CTYPE=$CTYPE  AC_CCACHE=$AC_CCACHE"
+
+          CCUSTOMOPTIONS="-DBOOST_ROOT=C:/local/boost_1_87_0 -DOPENSSL_ROOT_DIR=C:/openssl -DOPENSSL_USE_STATIC_LIBS=FALSE -DCMAKE_RC_COMPILER=rc -DCMAKE_NINJA_FORCE_RESPONSE_FILE=ON -DCMAKE_NINJA_CMCLDEPS_RC=OFF -DCMAKE_C_USE_RESPONSE_FILE_FOR_OBJECTS=ON -DCMAKE_CXX_USE_RESPONSE_FILE_FOR_OBJECTS=ON -DCMAKE_C_USE_RESPONSE_FILE_FOR_INCLUDES=ON -DCMAKE_CXX_USE_RESPONSE_FILE_FOR_INCLUDES=ON -DCMAKE_C_USE_RESPONSE_FILE_FOR_LIBRARIES=ON -DCMAKE_CXX_USE_RESPONSE_FILE_FOR_LIBRARIES=ON"
+          EOF
+          cat conf/config.sh
+
+      - name: 启用 MSVC 环境
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
+        with:
+          arch: x64
+
+      - name: 编译
+        shell: bash
+        working-directory: C:\ac
+        env:
+          CC: cl
+          CXX: cl
+        run: |
+          cmake --version
+          ninja --version
+
+          rm -rf var/build/obj
+          LOG=/c/ac/build.log
+          : > "$LOG"
+          set +e
+          ./acore.sh compiler build 2>&1 | tee -a "$LOG"
+          status=${PIPESTATUS[0]}
+
+          if [ "$status" -ne 0 ] && grep -qiE 'ccache[^\n]*(error|fatal|failed)|ccache[^\n]*No such file or directory' "$LOG"; then
+            echo "::warning::ccache 问题，关掉重试一次"
+            sed -i 's/^AC_CCACHE=.*/AC_CCACHE="false"/' conf/config.sh
+            rm -rf var/build/obj
+            ./acore.sh compiler build 2>&1 | tee -a "$LOG"
+            status=${PIPESTATUS[0]}
+          fi
+
+          ccache -s 2>&1 | head -n 12 || true
+          if [ "$status" -ne 0 ]; then
+            echo "::error::编译失败（exit $status），摘出日志："
+            grep -inE 'error|fatal' "$LOG" | tail -n 40 || true
+          fi
+          exit "$status"
+
+      - name: 保存 ccache（失败也保存）
+        if: ${{ !cancelled() && steps.ccache_restore.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: C:\ccache
+          key: ${{ steps.ccache_restore.outputs.cache-primary-key }}
+
+      - name: 找回安装产物
+        shell: pwsh
+        run: |
+          $dist = 'C:\ac\env\dist'
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          if (Test-Path "$dist\worldserver.exe") { Write-Host 'env/dist 正常'; exit 0 }
+          Write-Warning 'env/dist 没有 worldserver.exe，尝试从别处捞'
+          foreach ($cand in @('C:\c\ac\env\dist', 'C:\ac\c\ac\env\dist')) {
+            if (Test-Path (Join-Path $cand 'worldserver.exe')) { robocopy $cand $dist /E /NFL /NDL /NJH /NJS /NP | Out-Null; $global:LASTEXITCODE = 0 }
+          }
+          Get-ChildItem 'C:\ac\var\build' -Recurse -Include 'worldserver.exe','authserver.exe' -ErrorAction SilentlyContinue |
+            ForEach-Object { Copy-Item $_.FullName $dist -Force }
+
+      - name: 补齐运行时 DLL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dist = 'C:\ac\env\dist'
+          $cand = [ordered]@{
+            'libmysql.dll'        = @('C:\tools\mysql\current\lib', 'C:\tools\mysql\current\bin')
+            'libcrypto-3-x64.dll' = @('C:\openssl\bin')
+            'libssl-3-x64.dll'    = @('C:\openssl\bin')
+            'legacy.dll'          = @('C:\openssl\bin')
+            'vcruntime140.dll'    = @('C:\Windows\System32')
+            'vcruntime140_1.dll'  = @('C:\Windows\System32')
+            'msvcp140.dll'        = @('C:\Windows\System32')
+          }
+          foreach ($n in $cand.Keys) {
+            if (Test-Path (Join-Path $dist $n)) { continue }
+            $src = @($cand[$n]) | Where-Object { Test-Path (Join-Path $_ $n) } | Select-Object -First 1
+            if ($src) { Copy-Item (Join-Path $src $n) $dist -Force; Write-Host "拷入 $n" } else { Write-Warning "缺 $n" }
+          }
+
+          $dll = Join-Path $dist 'libmysql.dll'
+          if (-not (Test-Path $dll)) { throw 'env/dist 没有 libmysql.dll' }
+          $fv = (Get-Item $dll).VersionInfo.FileVersion
+          Write-Host "libmysql.dll = $fv"
+          if ($fv -notlike "$env:MYSQL_VERSION*") { throw "libmysql.dll 是 $fv，与编译用的 $env:MYSQL_VERSION 不一致（ACE00046）" }
+
+      - name: 写入 BUILD_INFO.txt
+        shell: pwsh
+        env:
+          P_TAG: ${{ needs.setup.outputs.tag }}
+        run: |
+          $core = 'C:\ac'; $mod = 'C:\ac\modules\mod-playerbots'
+          $lines = @(
+            "CoA $env:P_TAG build info"
+            '========================='
+            "profile       = $env:P_TAG"
+            "modes         = ${{ needs.setup.outputs.modes }}"
+            "built_at      = $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')"
+            ''
+            'core_repo     = ${{ needs.setup.outputs.core_repo }}'
+            'core_ref      = ${{ needs.setup.outputs.core_ref }}'
+            "core_commit   = $((git -C $core rev-parse HEAD).Trim())"
+            "core_subject  = $((git -C $core log -1 --format=%s).Trim())"
+            ''
+            'module_repo   = ${{ needs.setup.outputs.module_repo }}'
+            'module_ref    = ${{ needs.setup.outputs.module_ref }}'
+            "module_commit = $((git -C $mod rev-parse HEAD).Trim())"
+            ''
+            '--- 依赖 ---'
+            'build_type    = ${{ inputs.build_type }}'
+            "mysql_client  = $env:MYSQL_VERSION"
+            'openssl       = 3.6.5'
+            'boost         = 1.87.0'
+            ''
+            '--- 本机使用 ---'
+            "1) 解压到 E:\Coa Compile\out\$env:P_TAG\"
+            '2) 源码对齐到上面的 commit（SQL 才和 exe 同版本）'
+            '3) 运行 tools\merge-repack.ps1 合并成 Repack'
+          )
+          $lines | Out-File -FilePath 'C:\ac\env\dist\BUILD_INFO.txt' -Encoding utf8
+          Get-Content 'C:\ac\env\dist\BUILD_INFO.txt'
+
+      - name: 上传编译原始产物
+        id: upload_raw
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.setup.outputs.tag }}-raw-dist-r${{ github.run_number }}
+          path: C:\ac\env\dist
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 1
+          overwrite: true
+
+      - name: 打包 SQL 源目录
+        if: ${{ inputs.db_source == 'yes' }}
+        id: dbpack
+        shell: pwsh
+        run: |
+          function Copy-SqlTree { param([string]$S, [string]$D, [string[]]$X)
+            if (-not (Test-Path $S)) { return }
+            $a = @($S, $D, '/E', '/NFL', '/NDL', '/NJH', '/NJS', '/NP'); if ($X) { $a += '/XD'; $a += $X }
+            & robocopy @a | Out-Null; if ($LASTEXITCODE -ge 8) { throw "robocopy 失败: $S" }; $global:LASTEXITCODE = 0
+          }
+          $pkg = 'C:\dbpkg'
+          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
+          Copy-SqlTree 'C:\ac\data\sql' "$pkg\data\sql" @('C:\ac\data\sql\old')
+          Copy-SqlTree 'C:\ac\data\coa-world' "$pkg\data\coa-world"
+          Copy-SqlTree 'C:\ac\apps\coa-world' "$pkg\apps\coa-world"
+          foreach ($m in Get-ChildItem 'C:\ac\modules' -Directory) { Copy-SqlTree (Join-Path $m.FullName 'data\sql') "$pkg\modules\$($m.Name)\data\sql" }
+          Copy-Item 'C:\ac\env\dist\BUILD_INFO.txt' "$pkg\BUILD_INFO.txt" -Force -ErrorAction SilentlyContinue
+
+          $zip = Join-Path $env:RUNNER_TEMP 'db-source.zip'
+          Push-Location $pkg
+          & 'C:\Program Files\7-Zip\7z.exe' a -tzip -mx=5 -bso0 -bsp0 $zip 'data' 'apps' 'modules' | Out-Null
+          Pop-Location
+          "zip=$zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: 上传 SQL 源目录
+        if: ${{ inputs.db_source == 'yes' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.setup.outputs.tag }}-db-source-r${{ github.run_number }}
+          path: ${{ steps.dbpack.outputs.zip }}
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+          overwrite: true
+
+      - name: 确认原始产物已上传
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace('${{ steps.upload_raw.outputs.artifact-url }}')) { throw '编译原始产物没上传成功' }
+          Write-Host 'OK'
+
+  package:
+    name: package (打包，可单独重跑)
+    needs: [setup, build]
+    runs-on: windows-2022
+    timeout-minutes: 30
+    env:
+      MYSQL_VERSION: 8.4.13
+    steps:
+      - name: 取回原始产物
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.setup.outputs.tag }}-raw-dist-r${{ github.run_number }}
+          path: C:\ac\env\dist
+
+      - name: 整理最终包
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dist = 'C:\ac\env\dist'; $pkg = 'C:\ac\pkg'
+          if (Test-Path $pkg) { Remove-Item $pkg -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
+
+          foreach ($n in @('authserver.exe', 'worldserver.exe')) {
+            if (-not (Test-Path (Join-Path $dist $n))) { throw "缺 $n" }
+            Copy-Item (Join-Path $dist $n) $pkg -Force
+          }
+          foreach ($n in @('libmysql.dll','libcrypto-3-x64.dll','libssl-3-x64.dll','legacy.dll','vcruntime140.dll','vcruntime140_1.dll','msvcp140.dll','BUILD_INFO.txt')) {
+            if (Test-Path (Join-Path $dist $n)) { Copy-Item (Join-Path $dist $n) $pkg -Force } else { Write-Warning "缺 $n" }
+          }
+
+          $my = Join-Path $pkg 'libmysql.dll'
+          if (-not (Test-Path $my)) { throw '最终包缺 libmysql.dll' }
+          $fv = (Get-Item $my).VersionInfo.FileVersion
+          if ($fv -notlike "$env:MYSQL_VERSION*") { throw "libmysql.dll 是 $fv，应为 $env:MYSQL_VERSION" }
+
+          $files = @(Get-ChildItem $pkg -File | Sort-Object Name)
+          ($files | ForEach-Object { '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name }) |
+            Out-File -FilePath (Join-Path $pkg 'SHA256SUMS.txt') -Encoding utf8
+
+          $mb = ($files | Measure-Object Length -Sum).Sum / 1MB
+          $summary = @('### 最终包', '', ('共 **{0:N1} MB**，{1} 个文件' -f $mb, $files.Count), '', '| 文件 | 大小 |', '|---|---|')
+          $summary += @($files | ForEach-Object { '| `{0}` | {1:N2} MB |' -f $_.Name, ($_.Length / 1MB) })
+          $summary += @('', '> 下载后解压到 `E:\Coa Compile\out\${{ needs.setup.outputs.tag }}\`，再跑 `tools\merge-repack.ps1`。')
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: 上传最终包
+        id: upload_server
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.setup.outputs.tag }}-server-windows-r${{ github.run_number }}
+          path: C:\ac\pkg
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 1
+          overwrite: true
+
+      - name: 记录上传结果
+        shell: pwsh
+        run: |
+          $url = '${{ steps.upload_server.outputs.artifact-url }}'
+          $lines = @('### 最终产物', '')
+          if ([string]::IsNullOrWhiteSpace($url)) {
+            $lines += '- ❌ 上传失败（artifact-url 为空）'
+            $lines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            throw '上传失败'
+          }
+          $lines += '- ✅ **${{ needs.setup.outputs.tag }}-server-windows-r${{ github.run_number }}**'
+          $lines += '    - SHA-256: ${{ steps.upload_server.outputs.artifact-digest }}'
+          $lines += '    - 下载: ' + $url
+          $lines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8

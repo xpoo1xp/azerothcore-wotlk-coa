@@ -54,6 +54,7 @@ jobs:
     uses: ./.github/workflows/build-profile-windows.yml
     with:
       profile: a52
+      core_repo: Brytenwally/azerothcore-wotlk-coa
       core_ref: ${{ inputs.core_ref }}
       module_ref: ${{ inputs.module_ref }}
       build_type: ${{ inputs.build_type }}

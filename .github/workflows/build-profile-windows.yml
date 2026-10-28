@@ -147,6 +147,34 @@ jobs:
           path: a/modules/mod-playerbots
           fetch-depth: 1
 
+      # 本仓库 ci/patches/*.patch 会在编译前打到核心上；打不上（已应用/不适用）就跳过，
+      # 这样即使上游还没合并某些修复，云编译产物也和本地验证过的一致。
+      - name: 取回构建补丁
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          path: meta
+          fetch-depth: 1
+          sparse-checkout: ci
+
+      - name: 应用构建补丁
+        shell: bash
+        working-directory: a
+        run: |
+          shopt -s nullglob
+          applied=0
+          for patch in "$GITHUB_WORKSPACE"/meta/ci/patches/*.patch; do
+            name=$(basename "$patch")
+            if git apply --check "$patch" 2>/dev/null; then
+              git apply "$patch"
+              echo "applied: $name"
+              applied=$((applied + 1))
+            else
+              echo "skip (already applied or not applicable): $name"
+            fi
+          done
+          echo "手动补丁应用数量: $applied"
+
       - name: 移动到短路径 C:\ac
         shell: pwsh
         run: |

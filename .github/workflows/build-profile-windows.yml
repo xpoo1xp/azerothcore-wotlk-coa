@@ -162,10 +162,18 @@ jobs:
         working-directory: a
         run: |
           shopt -s nullglob
-          if [ ! -d "$GITHUB_WORKSPACE/meta/ci/patches" ]; then
-          ...
-          fi
-
+          applied=0
+          for patch in "$GITHUB_WORKSPACE"/meta/ci/patches/*.patch; do
+            name=$(basename "$patch")
+            if git apply --check "$patch" 2>/dev/null; then
+              git apply "$patch"
+              echo "applied: $name"
+              applied=$((applied + 1))
+            else
+              echo "skip (already applied or not applicable): $name"
+            fi
+          done
+          echo "手动补丁应用数量: $applied"
 
       - name: 移动到短路径 C:\ac
         shell: pwsh

@@ -5,7 +5,8 @@
 # Actions → Build A52 (Windows) → Run workflow → 什么都不用填
 #
 # 默认：
-#   核心 = CWO4PapaBear/azerothcore-wotlk-coa @ main
+#   核心 = Brytenwally/azerothcore-wotlk-coa @ main（= CWO4PapaBear/main + 后续合并，
+#          含 ARENA_TYPE_1v1；CWO4PapaBear 的 main 缺这个枚举，编 playerbots 会报 C2065）
 #   模块 = Brytenwally/mod-playerbots @ area52-freepick
 #
 # 产物 a52-server-windows-rXX.zip → 解压到 E:\Coa Compile\out\a52\
@@ -39,12 +40,12 @@ on:
           - 'yes'
         default: 'no'
       db_source:
-        description: '是否打包 SQL 源目录（本地有源码时不需要）'
+        description: '是否打包 SQL 源目录（选 yes 会多产出 a52-db-source-rN.zip，配合 updates 目录可免打完整包）'
         type: choice
         options:
-          - 'no'
           - 'yes'
-        default: 'no'
+          - 'no'
+        default: 'yes'
 
 permissions:
   contents: read
@@ -54,6 +55,8 @@ jobs:
     uses: ./.github/workflows/build-profile-windows.yml
     with:
       profile: a52
+      # 必须指到 Brytenwally 的 main：CWO4PapaBear/main 还没有 ARENA_TYPE_1v1，
+      # mod-playerbots@area52-freepick 会编译失败（error C2065）
       core_repo: Brytenwally/azerothcore-wotlk-coa
       core_ref: ${{ inputs.core_ref }}
       module_ref: ${{ inputs.module_ref }}
